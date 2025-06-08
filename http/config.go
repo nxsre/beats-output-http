@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/elastic/elastic-agent-libs/config"
 	"github.com/elastic/elastic-agent-libs/transport/tlscommon"
 )
 
@@ -20,6 +21,7 @@ type httpConfig struct {
 	CompressionLevel int               `config:"compression_level" validate:"min=0, max=9"`
 	TLS              *tlscommon.Config `config:"tls"`
 	MaxRetries       int               `config:"max_retries"`
+	Queue            config.Namespace  `config:"queue"`
 	Timeout          time.Duration     `config:"timeout"`
 	Headers          map[string]string `config:"headers"`
 	ContentType      string            `config:"content_type"`

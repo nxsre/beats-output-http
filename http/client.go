@@ -4,16 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/dgrijalva/jwt-go/v4"
+	"github.com/jinzhu/copier"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
 	"github.com/elastic/beats/v7/libbeat/outputs"
 	"github.com/elastic/beats/v7/libbeat/outputs/outil"
 	"github.com/elastic/beats/v7/libbeat/publisher"
+	"github.com/elastic/elastic-agent-libs/logp"
 	"github.com/elastic/elastic-agent-libs/mapstr"
 	"github.com/elastic/elastic-agent-libs/transport"
 	"github.com/elastic/elastic-agent-libs/transport/tlscommon"
@@ -49,6 +54,7 @@ type ClientSettings struct {
 	Headers            map[string]string
 	ContentType        string
 	Format             string
+	Logger             *logp.Logger
 }
 
 // Connection struct
@@ -60,6 +66,7 @@ type Connection struct {
 	connected   bool
 	encoder     bodyEncoder
 	ContentType string
+	Logger      *logp.Logger
 }
 
 type eventRaw map[string]json.RawMessage
@@ -75,7 +82,7 @@ func NewClient(s ClientSettings) (*Client, error) {
 	if s.Proxy != nil {
 		proxy = http.ProxyURL(s.Proxy)
 	}
-	logger.Info("HTTP URL: %s", s.URL)
+	logger.Infof("HTTP URL: %s", s.URL)
 	var dialer, tlsDialer transport.Dialer
 	var err error
 
@@ -122,6 +129,7 @@ func NewClient(s ClientSettings) (*Client, error) {
 				Timeout: s.Timeout,
 			},
 			encoder: encoder,
+			Logger:  s.Logger,
 		},
 		params:           params,
 		compressionLevel: compression,
@@ -160,7 +168,7 @@ func (client *Client) Clone() *Client {
 }
 
 // Connect establishes a connection to the clients sink.
-func (conn *Connection) Connect() error {
+func (conn *Connection) Connect(ctx context.Context) error {
 	conn.connected = true
 	return nil
 }
@@ -201,15 +209,16 @@ func (client *Client) publishEvents(data []publisher.Event) ([]publisher.Event, 
 	sendErr := error(nil)
 	if client.batchPublish {
 		// Publish events in bulk
-		logger.Debugf("Publishing events in batch.")
+		logger.Infof("Publishing events in batch.")
 		sendErr = client.BatchPublishEvent(data)
 		if sendErr != nil {
 			return data, sendErr
 		}
 	} else {
-		logger.Debugf("Publishing events one by one.")
-		for index, event := range data {
-			sendErr = client.PublishEvent(event)
+		logger.Infof("Publishing events one by one.")
+		// 进这里单条发送
+		for index, msg := range data {
+			sendErr = client.PublishEvent(msg)
 			if sendErr != nil {
 				// return the rest of the data with the error
 				failedEvents = data[index:]
@@ -217,7 +226,7 @@ func (client *Client) publishEvents(data []publisher.Event) ([]publisher.Event, 
 			}
 		}
 	}
-	logger.Debugf("PublishEvents: %d metrics have been published over HTTP in %v.", len(data), time.Now().Sub(begin))
+	logger.Infof("PublishEvents: %d metrics have been published over HTTP in %v.", len(data), time.Now().Sub(begin))
 	if len(failedEvents) > 0 {
 		return failedEvents, sendErr
 	}
@@ -257,8 +266,8 @@ func (client *Client) PublishEvent(data publisher.Event) error {
 		return ErrNotConnected
 	}
 	event := data
-	logger.Debugf("Publish event: %s", event)
-	status, _, err := client.request("POST", client.params, makeEvent(&event.Content), client.headers)
+	//status, _, err := client.request("POST", client.params, makeEvent(&event.Content), client.headers)
+	status, _, err := client.request("POST", client.params, makeEventFromDissect(&event.Content), client.headers)
 	if err != nil {
 		logger.Warn("Fail to insert a single event: %s", err)
 		if err == ErrJSONEncodeFailed {
@@ -281,7 +290,6 @@ func (client *Client) PublishEvent(data publisher.Event) error {
 
 func (conn *Connection) request(method string, params map[string]string, body interface{}, headers map[string]string) (int, []byte, error) {
 	urlStr := addToURL(conn.URL, params)
-	logger.Debugf("%s %s %v", method, urlStr, body)
 
 	if body == nil {
 		return conn.execRequest(method, urlStr, nil, headers)
@@ -303,6 +311,12 @@ func (conn *Connection) execRequest(method, url string, body io.Reader, headers 
 	if body != nil {
 		conn.encoder.AddHeader(&req.Header, conn.ContentType)
 	}
+
+	//bs, err := httputil.DumpRequest(req, true)
+	//if err != nil {
+	//	logger.Warn("Failed to dump request: %v", err)
+	//}
+	//fmt.Println(string(bs))
 	return conn.execHTTPRequest(req, headers)
 }
 
@@ -346,7 +360,7 @@ func makeEvent(v *beat.Event) map[string]json.RawMessage {
 	// Inline not supported,
 	// HT: https://stackoverflow.com/questions/49901287/embed-mapstringstring-in-go-json-marshaling-without-extra-json-property-inlin
 	type event0 event // prevent recursion
-	e := event{Timestamp: v.Timestamp.UTC(), Fields: v.Fields}
+	e := event{Timestamp: v.Timestamp.UTC(), Fields: mapstr.M(v.Fields)}
 	b, err := json.Marshal(event0(e))
 	if err != nil {
 		logger.Warn("Error encoding event to JSON: %v", err)
@@ -366,4 +380,115 @@ func makeEvent(v *beat.Event) map[string]json.RawMessage {
 		eventMap[j] = b
 	}
 	return eventMap
+}
+
+// makeEventFromDissect 单条发送大数据平台固定格式
+func makeEventFromDissect(v *beat.Event) map[string]json.RawMessage {
+	// request_time 使用 timestamp processer 处理过的日志时间
+	var event0 = mapstr.M{
+		"request_time": v.Timestamp.UTC(),
+	}
+
+	if dissect, ok := v.Fields["dissect"]; ok {
+		err := copier.Copy(&event0, dissect)
+		if err != nil {
+			logger.Warn("Error decoding dissect to JSON: %v", err)
+			return nil
+		}
+		if token, ok := event0["http_authorization"]; ok {
+			delete(event0, "http_authorization")
+			if tokenStr, ok := token.(string); ok && tokenStr != "-" {
+				parseToken, err := ParseToken(tokenStr)
+				if err == nil {
+					event0["user_id"] = parseToken.UserID
+					event0["user_key"] = parseToken.UserKey
+				} else {
+					logger.Warnf("Error parsing token: %v", err)
+				}
+			}
+		}
+	}
+
+	if request_body, ok := event0["request_body"]; ok {
+		// nginx 记录 body 的格式是  "{\\x22createTime\\x22:null}", 需要对 \\22 处理，转换为正常的 json
+		event0["request_body"], _ = strconv.Unquote(fmt.Sprintf(`"%s"`, request_body))
+	}
+
+	if _, ok := event0["request_uri"]; !ok {
+		return nil
+	}
+
+	request_url, _ := url.ParseRequestURI(fmt.Sprint(event0["request_uri"]))
+	api_url := url.URL{
+		Scheme: fmt.Sprint(event0["scheme"]),
+		Host:   fmt.Sprint(event0["host"]),
+		Path:   request_url.Path,
+	}
+	event0["api_url"] = api_url.String()
+	event0["query_string"] = request_url.RawQuery
+
+	// nginx_type 字段, 1:资管  2:云管  3:信令
+	if _, ok := event0["nginx_type"]; !ok {
+		if strings.HasPrefix(request_url.Path, "/signalman/signal") {
+			event0["nginx_type"] = 3
+		} else {
+			event0["nginx_type"] = 1
+		}
+	}
+
+	b, err := json.Marshal(event0)
+	if err != nil {
+		logger.Warn("Error encoding event to JSON: %v", err)
+	}
+
+	var eventMap map[string]json.RawMessage
+	err = json.Unmarshal(b, &eventMap)
+	if err != nil {
+		logger.Warn("Error decoding JSON to map: %v", err)
+	}
+	return eventMap
+}
+
+type Claims struct {
+	UserID       int64  `json:"user_id"`
+	UserKey      string `json:"user_key"`
+	IsAllowLogin bool   `json:"isAllowLogin"`
+	IsAppUser    bool   `json:"isAppUser"`
+	Username     string `json:"username"`
+	jwt.StandardClaims
+}
+
+func ParseToken(token string) (*Claims, error) {
+	if strings.HasPrefix(token, "Bearer ") {
+		token = strings.TrimSpace(strings.TrimLeft(token, "Bearer"))
+	}
+
+	// 有 jwtSecret 解析
+	//tokenClaims, err := jwt.ParseWithClaims(token, &Claims{}, func(token *jwt.Token) (interface{}, error) {
+	//	return "jwtSecret", nil
+	//})
+	//if err != nil {
+	//	return nil, err
+	//}
+	//
+	//if tokenClaims != nil {
+	//	if claims, ok := tokenClaims.Claims.(*Claims); ok && tokenClaims.Valid {
+	//		return claims, nil
+	//	}
+	//}
+	//
+	//return nil, err
+
+	// 没有 jwtSecret，只解析明文部分
+	jtoken, parts, err := new(jwt.Parser).ParseUnverified(token, &Claims{})
+	if err != nil {
+		return nil, err
+	}
+	_ = parts
+
+	if claims, ok := jtoken.Claims.(*Claims); !ok {
+		return nil, err
+	} else {
+		return claims, nil
+	}
 }

@@ -2,11 +2,10 @@ package http
 
 import (
 	"errors"
-
 	"github.com/elastic/beats/v7/libbeat/beat"
 	"github.com/elastic/beats/v7/libbeat/common"
 	"github.com/elastic/beats/v7/libbeat/outputs"
-	conf "github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/config"
 	"github.com/elastic/elastic-agent-libs/logp"
 	"github.com/elastic/elastic-agent-libs/transport/tlscommon"
 )
@@ -16,7 +15,7 @@ func init() {
 }
 
 var (
-	logger = logp.NewLogger("output.http")
+	logger *logp.Logger
 	// ErrNotConnected indicates failure due to client having no valid connection
 	ErrNotConnected = errors.New("not connected")
 	// ErrJSONEncodeFailed indicates encoding failures
@@ -27,8 +26,9 @@ func MakeHTTP(
 	_ outputs.IndexManager,
 	beat beat.Info,
 	observer outputs.Observer,
-	cfg *conf.C,
+	cfg *config.C,
 ) (outputs.Group, error) {
+	logger = logp.NewLogger("output.http")
 	config := defaultConfig
 	if err := cfg.Unpack(&config); err != nil {
 		return outputs.Fail(err)
@@ -37,7 +37,7 @@ func MakeHTTP(
 	if err != nil {
 		return outputs.Fail(err)
 	}
-	hosts, err := outputs.ReadHostList(cfg)
+	hosts, err := outputs.ReadHostList((cfg))
 	if err != nil {
 		return outputs.Fail(err)
 	}
@@ -84,5 +84,5 @@ func MakeHTTP(
 		client = outputs.WithBackoff(client, config.Backoff.Init, config.Backoff.Max)
 		clients[i] = client
 	}
-	return outputs.SuccessNet(config.LoadBalance, config.BatchSize, config.MaxRetries, clients)
+	return outputs.SuccessNet(config.Queue, config.LoadBalance, config.BatchSize, config.MaxRetries, nil, clients)
 }
