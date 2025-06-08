@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"github.com/dgrijalva/jwt-go/v4"
 	"github.com/jinzhu/copier"
+	"github.com/panjf2000/ants/v2"
+	"go.uber.org/zap/zapcore"
 	"io"
-	"io/ioutil"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"strings"
@@ -54,7 +56,7 @@ type ClientSettings struct {
 	Headers            map[string]string
 	ContentType        string
 	Format             string
-	Logger             *logp.Logger
+	PoolSize           int
 }
 
 // Connection struct
@@ -66,7 +68,8 @@ type Connection struct {
 	connected   bool
 	encoder     bodyEncoder
 	ContentType string
-	Logger      *logp.Logger
+	pool        *ants.PoolWithFunc
+	s           ClientSettings
 }
 
 type eventRaw map[string]json.RawMessage
@@ -122,14 +125,18 @@ func NewClient(s ClientSettings) (*Client, error) {
 			ContentType: s.ContentType,
 			http: &http.Client{
 				Transport: &http.Transport{
-					Dial:    dialer.Dial,
-					DialTLS: tlsDialer.Dial,
-					Proxy:   proxy,
+					Dial:                dialer.Dial,
+					DialTLS:             tlsDialer.Dial,
+					Proxy:               proxy,
+					MaxConnsPerHost:     100,
+					MaxIdleConns:        100,
+					MaxIdleConnsPerHost: 100,
 				},
 				Timeout: s.Timeout,
 			},
 			encoder: encoder,
-			Logger:  s.Logger,
+
+			s: s,
 		},
 		params:           params,
 		compressionLevel: compression,
@@ -169,12 +176,22 @@ func (client *Client) Clone() *Client {
 
 // Connect establishes a connection to the clients sink.
 func (conn *Connection) Connect(ctx context.Context) error {
+	poolSize := conn.s.PoolSize
+	if poolSize == 0 {
+		poolSize = 10
+	}
+	fmt.Println("ants PoolSize:", poolSize)
+	conn.pool, _ = ants.NewPoolWithFunc(poolSize, func(data any) {
+		task := data.(*Task)
+		task.Do()
+	}, ants.WithPreAlloc(true))
 	conn.connected = true
 	return nil
 }
 
 // Close closes a connection.
 func (conn *Connection) Close() error {
+	conn.pool.Release()
 	conn.connected = false
 	return nil
 }
@@ -244,7 +261,7 @@ func (client *Client) BatchPublishEvent(data []publisher.Event) error {
 	}
 	status, _, err := client.request("POST", client.params, events, client.headers)
 	if err != nil {
-		logger.Warn("Fail to insert a single event: %s", err)
+		logger.Warnf("Fail to insert a single event: %s", err)
 		if err == ErrJSONEncodeFailed {
 			// don't retry unencodable values
 			return nil
@@ -269,7 +286,7 @@ func (client *Client) PublishEvent(data publisher.Event) error {
 	//status, _, err := client.request("POST", client.params, makeEvent(&event.Content), client.headers)
 	status, _, err := client.request("POST", client.params, makeEventFromDissect(&event.Content), client.headers)
 	if err != nil {
-		logger.Warn("Fail to insert a single event: %s", err)
+		logger.Warnf("Fail to insert a single event: %s", err)
 		if err == ErrJSONEncodeFailed {
 			// don't retry unencodable values
 			return nil
@@ -291,33 +308,89 @@ func (client *Client) PublishEvent(data publisher.Event) error {
 func (conn *Connection) request(method string, params map[string]string, body interface{}, headers map[string]string) (int, []byte, error) {
 	urlStr := addToURL(conn.URL, params)
 
-	if body == nil {
-		return conn.execRequest(method, urlStr, nil, headers)
-	}
+	//if body == nil {
+	//	return conn.execRequest(method, urlStr, nil, headers)
+	//}
 
-	if err := conn.encoder.Marshal(body); err != nil {
-		logger.Warn("Failed to json encode body (%v): %#v", err, body)
-		return 0, nil, ErrJSONEncodeFailed
+	//if err := conn.encoder.Marshal(body); err != nil {
+	//	logger.Warnf("Failed to json encode body (%v): %#v", err, body)
+	//	return 0, nil, ErrJSONEncodeFailed
+	//}
+	//return conn.execRequest(method, urlStr, conn.encoder.Reader(), headers)
+
+	if err := conn.pool.Invoke(&Task{conn, method, urlStr, body, headers}); err != nil {
+		return 500, nil, err
 	}
-	return conn.execRequest(method, urlStr, conn.encoder.Reader(), headers)
+	return 200, []byte{}, nil
 }
 
 func (conn *Connection) execRequest(method, url string, body io.Reader, headers map[string]string) (int, []byte, error) {
 	req, err := http.NewRequest(method, url, body)
 	if err != nil {
-		logger.Warn("Failed to create request: %v", err)
+		logger.Warnf("Failed to create request: %v", err)
 		return 0, nil, err
 	}
 	if body != nil {
 		conn.encoder.AddHeader(&req.Header, conn.ContentType)
 	}
 
-	//bs, err := httputil.DumpRequest(req, true)
-	//if err != nil {
-	//	logger.Warn("Failed to dump request: %v", err)
-	//}
-	//fmt.Println(string(bs))
+	if logp.GetLevel() == zapcore.DebugLevel {
+		bs, err := httputil.DumpRequest(req, true)
+		if err != nil {
+			logger.Warnf("Failed to dump request: %v", err)
+		}
+		fmt.Println(string(bs))
+	}
+
 	return conn.execHTTPRequest(req, headers)
+}
+
+type Task struct {
+	conn    *Connection
+	method  string
+	url     string
+	body    interface{}
+	headers map[string]string
+}
+
+func (t *Task) Do() {
+	if t.body == nil {
+		t.conn.execRequest(t.method, t.url, nil, t.headers)
+	}
+
+	var encoder bodyEncoder
+	var err error
+	compression := t.conn.s.CompressionLevel
+	if compression == 0 {
+		switch t.conn.s.Format {
+		case "json":
+			encoder = newJSONEncoder(nil)
+		case "json_lines":
+			encoder = newJSONLinesEncoder(nil)
+		}
+	} else {
+		switch t.conn.s.Format {
+		case "json":
+			encoder, err = newGzipEncoder(compression, nil)
+		case "json_lines":
+			encoder, err = newGzipLinesEncoder(compression, nil)
+		}
+		if err != nil {
+			logger.Error(err)
+			return
+		}
+	}
+
+	if encoder != nil {
+		if err := encoder.Marshal(t.body); err != nil {
+			logger.Warnf("Failed to json encode body (%v): %#v", err, t.body)
+			return
+		}
+
+		if _, _, err := t.conn.execRequest(t.method, t.url, encoder.Reader(), t.headers); err != nil {
+			logger.Errorf("Failed to execute request: %v", err)
+		}
+	}
 }
 
 func (conn *Connection) execHTTPRequest(req *http.Request, headers map[string]string) (int, []byte, error) {
@@ -328,6 +401,7 @@ func (conn *Connection) execHTTPRequest(req *http.Request, headers map[string]st
 	if conn.Username != "" || conn.Password != "" {
 		req.SetBasicAuth(conn.Username, conn.Password)
 	}
+
 	resp, err := conn.http.Do(req)
 	if err != nil {
 		conn.connected = false
@@ -340,18 +414,19 @@ func (conn *Connection) execHTTPRequest(req *http.Request, headers map[string]st
 		conn.connected = false
 		return status, nil, fmt.Errorf("%v", resp.Status)
 	}
-	obj, err := ioutil.ReadAll(resp.Body)
+	obj, err := io.ReadAll(resp.Body)
 	if err != nil {
 		conn.connected = false
 		return status, nil, err
 	}
+
 	return status, obj, nil
 }
 
 func closing(c io.Closer) {
 	err := c.Close()
 	if err != nil {
-		logger.Warn("Close failed with: %v", err)
+		logger.Warnf("Close failed with: %v", err)
 	}
 }
 
@@ -363,19 +438,19 @@ func makeEvent(v *beat.Event) map[string]json.RawMessage {
 	e := event{Timestamp: v.Timestamp.UTC(), Fields: mapstr.M(v.Fields)}
 	b, err := json.Marshal(event0(e))
 	if err != nil {
-		logger.Warn("Error encoding event to JSON: %v", err)
+		logger.Warnf("Error encoding event to JSON: %v", err)
 	}
 
 	var eventMap map[string]json.RawMessage
 	err = json.Unmarshal(b, &eventMap)
 	if err != nil {
-		logger.Warn("Error decoding JSON to map: %v", err)
+		logger.Warnf("Error decoding JSON to map: %v", err)
 	}
 	// Add the individual fields to the map, flatten "Fields"
 	for j, k := range e.Fields {
 		b, err = json.Marshal(k)
 		if err != nil {
-			logger.Warn("Error encoding map to JSON: %v", err)
+			logger.Warnf("Error encoding map to JSON: %v", err)
 		}
 		eventMap[j] = b
 	}
@@ -386,13 +461,13 @@ func makeEvent(v *beat.Event) map[string]json.RawMessage {
 func makeEventFromDissect(v *beat.Event) map[string]json.RawMessage {
 	// request_time 使用 timestamp processer 处理过的日志时间
 	var event0 = mapstr.M{
-		"request_time": v.Timestamp.UTC(),
+		"request_time": v.Timestamp.Local(),
 	}
 
 	if dissect, ok := v.Fields["dissect"]; ok {
 		err := copier.Copy(&event0, dissect)
 		if err != nil {
-			logger.Warn("Error decoding dissect to JSON: %v", err)
+			logger.Warnf("Error decoding dissect to JSON: %v", err)
 			return nil
 		}
 		if token, ok := event0["http_authorization"]; ok {
@@ -438,13 +513,13 @@ func makeEventFromDissect(v *beat.Event) map[string]json.RawMessage {
 
 	b, err := json.Marshal(event0)
 	if err != nil {
-		logger.Warn("Error encoding event to JSON: %v", err)
+		logger.Warnf("Error encoding event to JSON: %v", err)
 	}
 
 	var eventMap map[string]json.RawMessage
 	err = json.Unmarshal(b, &eventMap)
 	if err != nil {
-		logger.Warn("Error decoding JSON to map: %v", err)
+		logger.Warnf("Error decoding JSON to map: %v", err)
 	}
 	return eventMap
 }
